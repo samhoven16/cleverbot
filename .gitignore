@@ -1,0 +1,5 @@
+.env
+premium_servers.json
+payments.json
+__pycache__/
+*.pyc
