@@ -7,11 +7,10 @@ import os
 import json
 import aiohttp
 from dotenv import load_dotenv
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from collections import defaultdict
 load_dotenv()
 
-# Fix SSL certificates on macOS
 ssl_context = ssl.create_default_context(cafile=certifi.where())
 
 # --- Config ---
@@ -22,18 +21,41 @@ TOPGG_TOKEN = os.getenv("TOPGG_TOKEN", "")
 BOT_ID = "1486859682311045271"
 TOPGG_VOTE_URL = f"https://top.gg/bot/{BOT_ID}/vote"
 
-# --- Free tier ---
 FREE_DAILY_LIMIT = 3
-VOTE_BONUS = 5  # extra questions for voting
-usage_tracker = defaultdict(lambda: {"count": 0, "date": str(date.today())})
-vote_bonus_tracker = defaultdict(int)  # user_id -> bonus questions remaining
+VOTE_BONUS = 5
 
 # --- Files ---
 PREMIUM_SERVERS_FILE = "premium_servers.json"
 PAYMENTS_FILE = "payments.json"
+USAGE_FILE = "usage.json"
 VOTERS_FILE = "voters.json"
 
-# --- Helpers ---
+# --- Persistent usage tracking (survives restarts) ---
+def load_usage():
+    if os.path.exists(USAGE_FILE):
+        with open(USAGE_FILE) as f:
+            return json.load(f)
+    return {}
+
+def save_usage(data):
+    with open(USAGE_FILE, "w") as f:
+        json.dump(data, f)
+
+def get_usage(server_id):
+    data = load_usage()
+    key = str(server_id)
+    today = str(date.today())
+    if key not in data or data[key]["date"] != today:
+        data[key] = {"count": 0, "date": today}
+        save_usage(data)
+    return data, key
+
+def increment_usage(server_id):
+    data, key = get_usage(server_id)
+    data[key]["count"] += 1
+    save_usage(data)
+
+# --- Premium ---
 def load_premium():
     if os.path.exists(PREMIUM_SERVERS_FILE):
         with open(PREMIUM_SERVERS_FILE) as f:
@@ -44,33 +66,53 @@ def save_premium(servers):
     with open(PREMIUM_SERVERS_FILE, "w") as f:
         json.dump(list(servers), f)
 
+# --- Payments ---
 def load_payments():
     if os.path.exists(PAYMENTS_FILE):
         with open(PAYMENTS_FILE) as f:
             return json.load(f)
     return []
 
-def log_payment(server_id, server_name, amount, note=""):
+def log_payment(server_id, server_name, amount):
     payments = load_payments()
     payments.append({
         "date": str(datetime.now()),
         "server_id": server_id,
         "server_name": server_name,
-        "amount": amount,
-        "note": note
+        "amount": amount
     })
     with open(PAYMENTS_FILE, "w") as f:
         json.dump(payments, f, indent=2)
 
+# --- Voters (prevent double-claiming) ---
 def load_voters():
     if os.path.exists(VOTERS_FILE):
         with open(VOTERS_FILE) as f:
             return json.load(f)
     return {}
 
-def save_voter(user_id):
+def has_claimed_vote_today(user_id):
+    voters = load_voters()
+    key = str(user_id)
+    if key not in voters:
+        return False
+    last = datetime.fromisoformat(voters[key])
+    return datetime.now() - last < timedelta(hours=12)
+
+def record_vote_claim(user_id):
     voters = load_voters()
     voters[str(user_id)] = str(datetime.now())
+    with open(VOTERS_FILE, "w") as f:
+        json.dump(voters, f, indent=2)
+
+# --- Vote bonus (persistent) ---
+def get_vote_bonus(user_id):
+    voters = load_voters()
+    return voters.get(f"bonus_{user_id}", 0)
+
+def set_vote_bonus(user_id, amount):
+    voters = load_voters()
+    voters[f"bonus_{user_id}"] = amount
     with open(VOTERS_FILE, "w") as f:
         json.dump(voters, f, indent=2)
 
@@ -82,17 +124,19 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 claude = anthropic.Anthropic(api_key=CLAUDE_KEY)
 
-# --- On ready ---
+# --- BUG FIX: check if tasks already running before starting ---
 @bot.event
 async def on_ready():
     print(f"✅ {bot.user} is live in {len(bot.guilds)} servers")
     await bot.change_presence(activity=discord.Game("!ask | AI Assistant | !vote"))
-    daily_upsell.start()
-    vote_reminder.start()
-    post_stats.start()
+    if not daily_upsell.is_running():
+        daily_upsell.start()
+    if not vote_reminder.is_running():
+        vote_reminder.start()
+    if not post_stats.is_running():
+        post_stats.start()
     print("🚀 All automations started")
 
-# --- New server: auto welcome ---
 @bot.event
 async def on_guild_join(guild):
     print(f"Joined: {guild.name} ({guild.id})")
@@ -101,15 +145,15 @@ async def on_guild_join(guild):
             await channel.send(
                 f"👋 **CleverBot has arrived!**\n\n"
                 f"I'm an AI assistant powered by Claude AI.\n\n"
-                f"**Try me now:** `!ask what can you do?`\n\n"
+                f"**Try me:** `!ask what can you do?`\n"
                 f"🆓 **Free:** {FREE_DAILY_LIMIT} questions/day\n"
                 f"⭐ **Premium:** Unlimited for $9.99/month → `{OWNER_EMAIL}`\n"
-                f"🗳️ **Vote for free bonus questions:** {TOPGG_VOTE_URL}"
+                f"🗳️ **Vote for bonus questions:** {TOPGG_VOTE_URL}"
             )
             break
 
-# --- Auto: post server count to top.gg every 30 min (boosts ranking) ---
-@tasks.loop(minutes=30)
+# --- Auto: post server count to top.gg (boosts ranking) ---
+@tasks.loop(hours=1)
 async def post_stats():
     if not TOPGG_TOKEN:
         return
@@ -120,7 +164,6 @@ async def post_stats():
                 json={"server_count": len(bot.guilds)},
                 headers={"Authorization": TOPGG_TOKEN}
             )
-            print(f"📊 Posted stats: {len(bot.guilds)} servers")
     except Exception as e:
         print(f"Stats post error: {e}")
 
@@ -128,17 +171,17 @@ async def post_stats():
 async def before_stats():
     await bot.wait_until_ready()
 
-# --- Auto: daily upsell to free servers ---
-@tasks.loop(hours=24)
+# --- BUG FIX: upsell weekly not daily (daily gets bots kicked) ---
+@tasks.loop(hours=168)
 async def daily_upsell():
     for guild in bot.guilds:
         if guild.id not in premium_servers:
             for channel in guild.text_channels:
                 if channel.permissions_for(guild.me).send_messages:
                     await channel.send(
-                        f"💡 **CleverBot Daily Tip**\n"
-                        f"Use `!ask` to get instant AI answers on anything!\n\n"
-                        f"🗳️ Vote for free bonus questions: {TOPGG_VOTE_URL}\n"
+                        f"💡 **CleverBot Weekly Tip**\n"
+                        f"Use `!ask` to get instant AI answers!\n\n"
+                        f"🗳️ Vote free for bonus questions: {TOPGG_VOTE_URL}\n"
                         f"⭐ Go unlimited with Premium: `{OWNER_EMAIL}`"
                     )
                     break
@@ -147,15 +190,15 @@ async def daily_upsell():
 async def before_upsell():
     await bot.wait_until_ready()
 
-# --- Auto: vote reminder every 12 hours ---
-@tasks.loop(hours=12)
+# --- BUG FIX: vote reminder weekly not every 12h (was extremely spammy) ---
+@tasks.loop(hours=168)
 async def vote_reminder():
     for guild in bot.guilds:
         for channel in guild.text_channels:
             if channel.permissions_for(guild.me).send_messages:
                 await channel.send(
-                    f"🗳️ **Vote for CleverBot on top.gg — it's free!**\n"
-                    f"Voting takes 5 seconds and gives you **{VOTE_BONUS} bonus questions**!\n"
+                    f"🗳️ **Vote for CleverBot — free & takes 5 seconds!**\n"
+                    f"Get **{VOTE_BONUS} bonus questions** just for voting!\n"
                     f"👉 {TOPGG_VOTE_URL}"
                 )
                 break
@@ -167,43 +210,43 @@ async def before_vote():
 # --- Commands ---
 @bot.command(name="ask")
 async def ask(ctx, *, question: str):
-    """Ask the AI anything."""
     server_id = ctx.guild.id
     user_id = ctx.author.id
 
     if server_id not in premium_servers:
-        tracker = usage_tracker[server_id]
-        if tracker["date"] != str(date.today()):
-            tracker["count"] = 0
-            tracker["date"] = str(date.today())
+        data, key = get_usage(server_id)
+        count = data[key]["count"]
+        bonus = get_vote_bonus(user_id)
 
-        # Use vote bonus first
-        if vote_bonus_tracker[user_id] > 0:
-            vote_bonus_tracker[user_id] -= 1
-        elif tracker["count"] >= FREE_DAILY_LIMIT:
+        if bonus > 0:
+            set_vote_bonus(user_id, bonus - 1)
+        elif count >= FREE_DAILY_LIMIT:
             await ctx.send(
-                f"⚠️ **Daily limit reached** ({FREE_DAILY_LIMIT} questions/day on free plan).\n"
+                f"⚠️ **Daily limit reached** ({FREE_DAILY_LIMIT}/day on free plan).\n"
                 f"🗳️ **Vote for {VOTE_BONUS} free bonus questions:** {TOPGG_VOTE_URL}\n"
-                f"⭐ **Or go unlimited:** `{OWNER_EMAIL}`"
+                f"⭐ **Go unlimited:** `{OWNER_EMAIL}`"
             )
             return
         else:
-            tracker["count"] += 1
+            increment_usage(server_id)
+            data, key = get_usage(server_id)
+            count = data[key]["count"]
 
     async with ctx.typing():
         try:
             response = claude.messages.create(
                 model="claude-haiku-4-5-20251001",
-                max_tokens=600,
+                max_tokens=500,
                 messages=[{"role": "user", "content": question}]
             )
             answer = response.content[0].text
             if server_id in premium_servers:
                 footer = "\n\n*⭐ Premium*"
             else:
-                left = FREE_DAILY_LIMIT - usage_tracker[server_id]["count"]
-                bonus = vote_bonus_tracker[user_id]
-                footer = f"\n\n*Free — {left} questions left today{f' + {bonus} vote bonus' if bonus > 0 else ''}. Vote for more: {TOPGG_VOTE_URL}*"
+                data, key = get_usage(server_id)
+                left = FREE_DAILY_LIMIT - data[key]["count"]
+                bonus = get_vote_bonus(user_id)
+                footer = f"\n\n*Free — {left} left today{f' + {bonus} bonus' if bonus > 0 else ''}. More: {TOPGG_VOTE_URL}*"
             await ctx.send(f"{answer}{footer}")
         except Exception as e:
             await ctx.send("❌ Something went wrong. Try again.")
@@ -211,43 +254,60 @@ async def ask(ctx, *, question: str):
 
 @bot.command(name="vote")
 async def vote(ctx):
-    """Get bonus questions by voting on top.gg."""
     await ctx.send(
         f"🗳️ **Vote for CleverBot — completely free!**\n\n"
         f"👉 {TOPGG_VOTE_URL}\n\n"
-        f"After voting you get **{VOTE_BONUS} bonus questions** instantly!\n"
+        f"After voting type `!voted` to claim **{VOTE_BONUS} bonus questions**!\n"
         f"You can vote every 12 hours."
     )
 
+# --- BUG FIX: voted now checks top.gg API + prevents double-claiming ---
 @bot.command(name="voted")
 async def voted(ctx):
-    """Claim your vote bonus (use after voting on top.gg)."""
     user_id = ctx.author.id
-    voters = load_voters()
-    if str(user_id) in voters:
-        vote_bonus_tracker[user_id] += VOTE_BONUS
-        await ctx.send(f"✅ Thanks for voting! You got **{VOTE_BONUS} bonus questions**!")
-        save_voter(user_id)
-    else:
-        await ctx.send(
-            f"❌ Vote not detected yet.\n"
-            f"1. Vote here: {TOPGG_VOTE_URL}\n"
-            f"2. Then type `!voted` again."
-        )
+
+    if has_claimed_vote_today(user_id):
+        await ctx.send("⏳ You already claimed your vote bonus in the last 12 hours. Vote again after 12 hours!")
+        return
+
+    if not TOPGG_TOKEN:
+        await ctx.send("⚠️ Vote verification not set up yet. Contact the bot owner.")
+        return
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            resp = await session.get(
+                f"https://top.gg/api/bots/{BOT_ID}/check?userId={user_id}",
+                headers={"Authorization": TOPGG_TOKEN}
+            )
+            data = await resp.json()
+
+        if data.get("voted") == 1:
+            current = get_vote_bonus(user_id)
+            set_vote_bonus(user_id, current + VOTE_BONUS)
+            record_vote_claim(user_id)
+            await ctx.send(f"✅ Vote confirmed! You got **{VOTE_BONUS} bonus questions**. Thanks for supporting CleverBot!")
+        else:
+            await ctx.send(
+                f"❌ No vote detected yet.\n"
+                f"1. Vote here: {TOPGG_VOTE_URL}\n"
+                f"2. Wait a few seconds\n"
+                f"3. Type `!voted` again"
+            )
+    except Exception as e:
+        await ctx.send("❌ Could not verify vote. Try again in a moment.")
+        print(f"Vote check error: {e}")
 
 @bot.command(name="status")
 async def status(ctx):
-    """Check plan and usage."""
     server_id = ctx.guild.id
     user_id = ctx.author.id
     if server_id in premium_servers:
-        await ctx.send(f"⭐ **Premium Plan** — Unlimited AI questions!")
+        await ctx.send("⭐ **Premium Plan** — Unlimited AI questions!")
     else:
-        tracker = usage_tracker[server_id]
-        if tracker["date"] != str(date.today()):
-            tracker["count"] = 0
-        left = FREE_DAILY_LIMIT - tracker["count"]
-        bonus = vote_bonus_tracker[user_id]
+        data, key = get_usage(server_id)
+        left = FREE_DAILY_LIMIT - data[key]["count"]
+        bonus = get_vote_bonus(user_id)
         await ctx.send(
             f"📊 **Free Plan**\n"
             f"Questions left today: {left}/{FREE_DAILY_LIMIT}\n"
@@ -258,7 +318,6 @@ async def status(ctx):
 
 @bot.command(name="upgrade")
 async def upgrade(ctx):
-    """Show upgrade info."""
     await ctx.send(
         f"⭐ **Upgrade to Premium**\n\n"
         f"✅ Unlimited AI questions\n"
